@@ -1,0 +1,51 @@
+Using the VS Code MCP RAG Extension
+This VS Code extension creates a seamless integration between your MCP RAG server and the Coder agent. Here's how to use it:
+Setup and Installation
+
+Create a new VS Code extension project:
+bashCopynpm init vscode-extension vscode-mcp-rag
+cd vscode-mcp-rag
+
+Copy the provided files into the project:
+
+package.json (extension manifest)
+src/extension.ts (main extension code)
+resources/mcp-icon.svg (extension icon)
+
+
+Install dependencies:
+bashCopynpm install axios
+npm install --save-dev @types/node @types/vscode
+
+Build the extension:
+bashCopynpm run compile
+
+Install the extension by pressing F5 in VS Code or packaging it as a VSIX file:
+bashCopynpm run vscode:prepublish
+npx vsce package
+
+
+Features
+The extension provides these key features:
+
+Code Context Search: Search your codebase for relevant snippets based on your query.
+Project Reindexing: Trigger reindexing of your project directory.
+Coder Agent Integration: Send searched context and queries to your Coder agent.
+Context Exploration: View and navigate through found code snippets.
+Query History: Keep track of your past queries for easy reuse.
+
+Commands
+
+MCP: Connect to RAG Server: Connect to your running MCP RAG server
+MCP: Search Code Context: Search for relevant code in your project
+MCP: Reindex Project: Reindex your project directory
+MCP: Send to Coder Agent: Send selected context to the Coder agent
+
+Integration with Coder Agent
+The extension assumes your Coder agent accepts a --context flag with a file path. When you use the "Send to Coder Agent" command, it will:
+
+Save the current search results to a temporary Markdown file
+Open a terminal
+Execute the Coder agent with the context file and your query
+
+This allows your Coder agent to have relevant project context when responding to your requests.
