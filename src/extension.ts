@@ -1,7 +1,6 @@
 // src/extension.ts
 import * as vscode from 'vscode';
-import axios from 'axios';
-import { execFile } from 'child_process';
+import axios, { AxiosInstance } from 'axios';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -24,10 +23,14 @@ interface ServerStatus {
 }
 
 // State
-let serverUrl: string = 'http://localhost:8000';
+let serverUrl = 'http://localhost:8000';
 let serverStatus: ServerStatus | null = null;
 let currentResults: CodeChunk[] = [];
 let queryHistory: string[] = [];
+let axiosInstance: AxiosInstance;
+let serverStatusCache: { status: ServerStatus | null; timestamp: number } = { status: null, timestamp: 0 };
+const STATUS_CACHE_TTL = 5000; // 5 seconds cache
+let abortController: AbortController | null = null;
 
 // Views
 class CodeContextProvider implements vscode.TreeDataProvider<CodeChunkItem> {
@@ -129,22 +132,56 @@ class HistoryItem extends vscode.TreeItem {
 const contextProvider = new CodeContextProvider();
 const historyProvider = new HistoryProvider();
 
+// Initialize axios instance with timeout configuration
+function initializeAxiosInstance() {
+  axiosInstance = axios.create({
+    timeout: 30000, // 30 second timeout
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  });
+}
+
 // Utility functions
-async function checkServerConnection(): Promise<boolean> {
+async function checkServerConnection(useCache = true): Promise<boolean> {
+  // Use cached status if available and not expired
+  if (useCache && serverStatusCache.status && Date.now() - serverStatusCache.timestamp < STATUS_CACHE_TTL) {
+    serverStatus = serverStatusCache.status;
+    return serverStatus.status === 'running';
+  }
+
   try {
-    const response = await axios.get(`${serverUrl}/status`);
+    const response = await axiosInstance.get(`${serverUrl}/status`);
     serverStatus = response.data;
+    serverStatusCache = { status: serverStatus, timestamp: Date.now() };
     return response.data.status === 'running';
   } catch (error) {
+    serverStatusCache = { status: null, timestamp: Date.now() };
     return false;
   }
 }
 
-async function searchCode(query: string, k: number = 5): Promise<CodeChunk[]> {
+async function searchCode(query: string, k = 5): Promise<CodeChunk[]> {
   try {
-    const response = await axios.post(`${serverUrl}/query`, { query, k });
+    // Cancel any pending request
+    if (abortController) {
+      abortController.abort();
+    }
+    
+    // Create new abort controller for this request
+    abortController = new AbortController();
+    
+    const response = await axiosInstance.post(`${serverUrl}/query`, { query, k }, {
+      signal: abortController.signal
+    });
+    
+    abortController = null;
     return response.data.results || [];
   } catch (error) {
+    if (axios.isCancel(error)) {
+      vscode.window.showInformationMessage('Search cancelled');
+      return [];
+    }
     vscode.window.showErrorMessage(`Failed to search: ${error instanceof Error ? error.message : String(error)}`);
     return [];
   }
@@ -152,12 +189,12 @@ async function searchCode(query: string, k: number = 5): Promise<CodeChunk[]> {
 
 async function reindexProject(directory?: string): Promise<boolean> {
   try {
-    const data: any = {};
+    const data: Record<string, string> = {};
     if (directory) {
       data.directory = directory;
     }
     
-    const response = await axios.post(`${serverUrl}/reindex`, data);
+    const response = await axiosInstance.post(`${serverUrl}/reindex`, data);
     return response.status === 200;
   } catch (error) {
     vscode.window.showErrorMessage(`Failed to reindex: ${error instanceof Error ? error.message : String(error)}`);
@@ -167,7 +204,7 @@ async function reindexProject(directory?: string): Promise<boolean> {
 
 async function getFile(filePath: string): Promise<string | null> {
   try {
-    const response = await axios.get(`${serverUrl}/file`, {
+    const response = await axiosInstance.get(`${serverUrl}/file`, {
       params: { path: filePath }
     });
     return response.data.content;
@@ -213,17 +250,24 @@ function saveContextToTemp(results: CodeChunk[]): string {
   const tempDir = os.tmpdir();
   const tempFilePath = path.join(tempDir, `mcp_context_${Date.now()}.md`);
   
-  let content = '# MCP Context\n\n';
+  // Use array join for efficient string building
+  const contentParts = ['# MCP Context\n\n'];
   
   for (let i = 0; i < results.length; i++) {
     const chunk = results[i];
-    content += `## Result ${i+1}: ${chunk.file_path} (${chunk.start_line}-${chunk.end_line})\n`;
-    content += `Type: ${chunk.chunk_type}, Score: ${chunk.score.toFixed(2)}\n\n`;
-    content += '```\n';
-    content += chunk.content;
-    content += '\n```\n\n';
+    contentParts.push(
+      `## Result ${i+1}: ${chunk.file_path} (${chunk.start_line}-${chunk.end_line})\n`,
+      `Type: ${chunk.chunk_type}, Score: ${chunk.score.toFixed(2)}\n\n`,
+      '```\n',
+      chunk.content,
+      '\n```\n\n'
+    );
   }
   
+  const content = contentParts.join('');
+  
+  // Use async file write with sync fallback for simplicity
+  // In production, consider using promises API
   fs.writeFileSync(tempFilePath, content);
   return tempFilePath;
 }
@@ -241,12 +285,22 @@ async function sendToCoder(query: string, contextFile: string): Promise<void> {
   }
 }
 
+// Helper function to get configuration values
+function getConfig() {
+  const config = vscode.workspace.getConfiguration('vscode-mcp-rag');
+  return {
+    serverUrl: config.get<string>('serverUrl', 'http://localhost:8000'),
+    coderPath: config.get<string>('coderPath', 'coder'),
+    maxResults: config.get<number>('maxResults', 5)
+  };
+}
+
 // Extension commands
 async function connectToServer() {
-  const config = vscode.workspace.getConfiguration('vscode-mcp-rag');
-  serverUrl = config.get<string>('serverUrl', 'http://localhost:8000');
+  const config = getConfig();
+  serverUrl = config.serverUrl;
   
-  const isConnected = await checkServerConnection();
+  const isConnected = await checkServerConnection(false); // Force fresh check on explicit connect
   
   if (isConnected) {
     vscode.window.showInformationMessage(`Connected to MCP RAG server at ${serverUrl}`);
@@ -265,7 +319,7 @@ async function connectToServer() {
       });
       
       if (newUrl) {
-        config.update('serverUrl', newUrl, true);
+        await vscode.workspace.getConfiguration('vscode-mcp-rag').update('serverUrl', newUrl, true);
         serverUrl = newUrl;
         vscode.commands.executeCommand('vscode-mcp-rag.connect');
       }
@@ -319,14 +373,19 @@ async function searchCodeContext() {
     query = input;
   }
   
-  // Add to history
+  // Add to history (limit to 10 items)
+  const historyIndex = queryHistory.indexOf(query);
+  if (historyIndex > -1) {
+    queryHistory.splice(historyIndex, 1);
+  }
   queryHistory.unshift(query);
   if (queryHistory.length > 10) {
-    queryHistory.pop();
+    queryHistory = queryHistory.slice(0, 10);
   }
   historyProvider.refresh();
   
   // Show progress
+  const config = getConfig();
   const results = await vscode.window.withProgress<CodeChunk[]>(
     {
       location: vscode.ProgressLocation.Notification,
@@ -335,10 +394,7 @@ async function searchCodeContext() {
     },
     async (progress) => {
       progress.report({ increment: 50 });
-      const config = vscode.workspace.getConfiguration('vscode-mcp-rag');
-      const maxResults = config.get<number>('maxResults', 5);
-      
-      const results = await searchCode(query, maxResults);
+      const results = await searchCode(query, config.maxResults);
       progress.report({ increment: 50 });
       return results;
     }
@@ -412,8 +468,8 @@ async function reindexProjectCommand() {
   );
   
   if (success) {
-    // Update server status
-    await checkServerConnection();
+    // Update server status (force fresh check)
+    await checkServerConnection(false);
     vscode.window.showInformationMessage(
       `Successfully reindexed ${serverStatus?.num_chunks} code chunks from ${directory}`
     );
@@ -446,6 +502,9 @@ async function repeatQuery(query: string) {
 
 // Extension activation
 export function activate(context: vscode.ExtensionContext) {
+  // Initialize axios instance
+  initializeAxiosInstance();
+  
   // Register views
   vscode.window.createTreeView('mcpContextView', {
     treeDataProvider: contextProvider,
@@ -473,4 +532,13 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
   // Clean up resources
+  if (abortController) {
+    abortController.abort();
+    abortController = null;
+  }
+  
+  // Clear caches
+  serverStatusCache = { status: null, timestamp: 0 };
+  currentResults = [];
+  queryHistory = [];
 }
