@@ -246,7 +246,7 @@ async function openChunk(chunk: CodeChunk): Promise<void> {
   }
 }
 
-function saveContextToTemp(results: CodeChunk[]): string {
+async function saveContextToTemp(results: CodeChunk[]): Promise<string> {
   const tempDir = os.tmpdir();
   const tempFilePath = path.join(tempDir, `mcp_context_${Date.now()}.md`);
   
@@ -266,9 +266,8 @@ function saveContextToTemp(results: CodeChunk[]): string {
   
   const content = contentParts.join('');
   
-  // Use async file write with sync fallback for simplicity
-  // In production, consider using promises API
-  fs.writeFileSync(tempFilePath, content);
+  // Use async file write to avoid blocking the event loop
+  await fs.promises.writeFile(tempFilePath, content, 'utf8');
   return tempFilePath;
 }
 
@@ -380,7 +379,7 @@ async function searchCodeContext() {
   }
   queryHistory.unshift(query);
   if (queryHistory.length > 10) {
-    queryHistory = queryHistory.slice(0, 10);
+    queryHistory.splice(10);
   }
   historyProvider.refresh();
   
@@ -490,7 +489,7 @@ async function sendToCoderCommand() {
   if (!query) return;
   
   // Save context to temp file
-  const contextFile = saveContextToTemp(currentResults);
+  const contextFile = await saveContextToTemp(currentResults);
   
   // Send to Coder
   await sendToCoder(query, contextFile);
